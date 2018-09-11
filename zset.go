@@ -2,6 +2,7 @@ package zset
 
 import (
 	"math/rand"
+	"sync"
 )
 
 /*================================== Redis skipList APIs =====================================
@@ -63,7 +64,7 @@ type (
 	}
 	// SortedSet is the final exported sorted set we can use
 	SortedSet struct {
-		dict map[int64]*obj
+		dict sync.Map
 		zsl  *skipList
 	}
 	zrangespec struct {
@@ -327,7 +328,7 @@ func (zsl *skipList) zslLastInRange(ran *zrangespec) *skipListNode {
  * Min and max are inclusive, so a score >= min || score <= max is deleted.
  * Note that this function takes the reference to the hash table view of the
  * sorted set, in order to remove the elements from the hash table too. */
-func (zsl *skipList) zslDeleteRangeByScore(ran *zrangespec, dict map[int64]*obj) uint64 {
+func (zsl *skipList) zslDeleteRangeByScore(ran *zrangespec, dict sync.Map) uint64 {
 	removed := uint64(0)
 	update := make([]*skipListNode, _ZSKIPLIST_MAXLEVEL)
 	x := zsl.header
@@ -363,7 +364,7 @@ func (zsl *skipList) zslDeleteRangeByScore(ran *zrangespec, dict map[int64]*obj)
 		}
 		next := x.level[0].forward
 		zsl.zslDeleteNode(x, update)
-		delete(dict, x.objID)
+		dict.Delete(x.objID)
 		// Here is where x->obj is actually released.
 		// And golang has GC, don't need to free manually anymore
 		//zslFreeNode(x)
@@ -373,7 +374,7 @@ func (zsl *skipList) zslDeleteRangeByScore(ran *zrangespec, dict map[int64]*obj)
 	return removed
 }
 
-func (zsl *skipList) zslDeleteRangeByLex(ran *zlexrangespec, dict map[int64]*obj) uint64 {
+func (zsl *skipList) zslDeleteRangeByLex(ran *zlexrangespec, dict sync.Map) uint64 {
 	removed := uint64(0)
 
 	update := make([]*skipListNode, _ZSKIPLIST_MAXLEVEL)
@@ -392,7 +393,7 @@ func (zsl *skipList) zslDeleteRangeByLex(ran *zlexrangespec, dict map[int64]*obj
 	for x != nil && zslLexValueLteMax(x.objID, ran) {
 		next := x.level[0].forward
 		zsl.zslDeleteNode(x, update)
-		delete(dict, x.objID)
+		dict.Delete(x.objID)
 		removed++
 		x = next
 	}
@@ -424,7 +425,7 @@ func zslLexValueLteMax(id int64, spec *zlexrangespec) bool {
 
 /* Delete all the elements with rank between start and end from the skiplist.
  * Start and end are inclusive. Note that start and end need to be 1-based */
-func (zsl *skipList) zslDeleteRangeByRank(start, end uint64, dict map[int64]*obj) uint64 {
+func (zsl *skipList) zslDeleteRangeByRank(start, end uint64, dict sync.Map) uint64 {
 	update := make([]*skipListNode, _ZSKIPLIST_MAXLEVEL)
 	var traversed, removed uint64
 
@@ -442,7 +443,7 @@ func (zsl *skipList) zslDeleteRangeByRank(start, end uint64, dict map[int64]*obj
 	for x != nil && traversed <= end {
 		next := x.level[0].forward
 		zsl.zslDeleteNode(x, update)
-		delete(dict, x.objID)
+		dict.Delete(x.objID)
 		removed++
 		traversed++
 		x = next
@@ -497,7 +498,7 @@ func (zsl *skipList) zslGetElementByRank(rank uint64) *skipListNode {
 // New creates a new SortedSet and return its pointer
 func New() *SortedSet {
 	s := &SortedSet{
-		dict: make(map[int64]*obj),
+		dict: sync.Map{},
 		zsl:  zslCreate(),
 	}
 	return s
@@ -510,13 +511,15 @@ func (z *SortedSet) Length() int64 {
 
 // Set is used to add or update an element
 func (z *SortedSet) Set(score float64, key int64, dat interface{}) {
-	v, ok := z.dict[key]
-	z.dict[key] = &obj{attachment: dat, key: key, score: score}
+	v, ok := z.dict.Load(key)
+	z.dict.Store(key, &obj{attachment: dat, key: key, score: score})
 	if ok {
-		/* Remove and re-insert when score changes. */
-		if score != v.score {
-			z.zsl.zslDelete(v.score, key)
-			z.zsl.zslInsert(score, key)
+		if o, ok := v.(*obj); ok {
+			/* Remove and re-insert when score changes. */
+			if score != o.score {
+				z.zsl.zslDelete(o.score, key)
+				z.zsl.zslInsert(score, key)
+			}
 		}
 	} else {
 		z.zsl.zslInsert(score, key)
@@ -525,12 +528,14 @@ func (z *SortedSet) Set(score float64, key int64, dat interface{}) {
 
 // Delete removes an element from the SortedSet
 // by its key.
-func (z *SortedSet) Delete(key int64)(ok bool) {
-	v, ok := z.dict[key]
+func (z *SortedSet) Delete(key int64) (ok bool) {
+	v, ok := z.dict.Load(key)
 	if ok {
-		z.zsl.zslDelete(v.score, key)
-		delete(z.dict, key)
-		return true
+		if o, ok := v.(*obj); ok {
+			z.zsl.zslDelete(o.score, key)
+			z.dict.Delete(key)
+			return true
+		}
 	}
 	return false
 }
@@ -539,34 +544,36 @@ func (z *SortedSet) Delete(key int64)(ok bool) {
 // found by the parameter key.
 // The parameter reverse determines the rank is descent or ascend，
 // true means descend and false means ascend.
-func (z *SortedSet) GetRank(key int64, reverse bool) (rank int64, score float64,data interface{}) {
-	v, ok := z.dict[key]
+func (z *SortedSet) GetRank(key int64, reverse bool) (rank int64, score float64, data interface{}) {
+	v, ok := z.dict.Load(key)
 	if !ok {
 		return -1, 0, nil
 	}
-	r := z.zsl.zslGetRank(v.score, key)
+	o, _ := v.(*obj)
+	r := z.zsl.zslGetRank(o.score, key)
 	if reverse {
 		r = z.zsl.length - r
 	} else {
 		r--
 	}
-	return int64(r), v.score, v.attachment
+	return int64(r), o.score, o.attachment
 
 }
 
 // GetData returns data stored in the map by its key
-func (z *SortedSet) GetData(key int64) (data interface{},ok bool) {
-	o, ok := z.dict[key]
-	if !ok {
-		return nil, false
+func (z *SortedSet) GetData(key int64) (data interface{}, ok bool) {
+	if v, ok := z.dict.Load(key); ok {
+		if o, ok := v.(*obj); ok {
+			return o.attachment, true
+		}
 	}
-	return o.attachment, true
+	return nil, false
 }
 
 // GetDataByRank returns the id,score and extra data of an element which
 // found by position in the rank.
 // The parameter rank is the position, reverse says if in the descend rank.
-func (z *SortedSet) GetDataByRank(rank int64, reverse bool) (key int64,score float64,data interface{}) {
+func (z *SortedSet) GetDataByRank(rank int64, reverse bool) (key int64, score float64, data interface{}) {
 	if rank < 0 || rank > z.zsl.length {
 		return 0, 0, nil
 	}
@@ -579,9 +586,10 @@ func (z *SortedSet) GetDataByRank(rank int64, reverse bool) (key int64,score flo
 	if n == nil {
 		return 0, 0, nil
 	}
-	dat, _ := z.dict[n.objID]
-	if dat == nil {
-		return 0, 0, nil
+	if v, ok := z.dict.Load(n.objID); ok {
+		if o, ok := v.(*obj); ok {
+			return o.key, o.score, o.attachment
+		}
 	}
-	return dat.key, dat.score, dat.attachment
+	return 0, 0, nil
 }
